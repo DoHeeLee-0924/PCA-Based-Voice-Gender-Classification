@@ -1,0 +1,798 @@
+---
+pdf_document: default
+author: "김동현(2018170861), 이도희(2023270023), 한소은(2023380334)"
+title: "Final Project (IMEN415)"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+  pdf_document: defaults
+abstract: null
+---
+***
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+required_packages <- c(
+  "tidyverse",
+  "caret",
+  "pROC",
+  "car",
+  "corrplot",
+  "knitr"
+)
+
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+set.seed(123)
+```
+
+1. Introduction
+This project investigates whether Principal Component Analysis, PCA, improves the performance and robustness of logistic regression for voice-based gender classification.
+
+The original audio files were trimmed to the middle two seconds before feature extraction. This preprocessing step was applied because the beginning and ending parts of voice recordings often include silence or background noise. Acoustic features were extracted from each audio file using Python and then saved as CSV files. The statistical modeling and evaluation were conducted in R.
+
+The extracted features include 13 MFCC features, three spectral features, and two pitch-related features.
+
+
+<Research Question>
+Does PCA improve classification performance and model robustness when logistic regression is applied to voice-based gender classification?
+
+
+<Hypotheses>
+Hypothesis 1: Effect of PCA on model performance
+H0: There is no statistically significant difference in classification performance between logistic regression using original voice features and logistic regression using principal components.
+
+H1: Logistic regression using principal components shows statistically significant improvement in classification performance or model stability compared with logistic regression using original voice features.
+
+
+Hypothesis 2: Robustness under gender-ratio imbalance
+H0: Under imbalanced gender-ratio test conditions, the PCA-based logistic regression model does not show a statistically significant difference in performance stability compared with the non-PCA logistic regression model.
+
+H1: Under imbalanced gender-ratio test conditions, the PCA-based logistic regression model maintains more stable classification performance than the non-PCA logistic regression model.
+
+
+2. Data Loading
+```{r}
+project_dir <- "C:/Users/ldohe/Documents/다변량분석/project"
+
+voice_data <- read.csv(
+  file.path(project_dir, "voice_features_all.csv"),
+  fileEncoding = "UTF-8-BOM"
+)
+
+external_test <- read.csv(
+  file.path(project_dir, "voice_features_test.csv"),
+  fileEncoding = "UTF-8-BOM"
+)
+
+dim(voice_data)
+dim(external_test)
+head(voice_data)
+```
+
+3. Data Preprocessing
+```{r}
+voice_data$gender <- factor(
+  voice_data$gender,
+  levels = c("female", "male")
+)
+
+voice_data_model <- voice_data %>%
+  select(-FileName)
+
+# Remove columns with more than 50% missing values
+voice_data_model <- voice_data_model %>%
+  select(where(~ mean(is.na(.)) < 0.5))
+
+# Median imputation for remaining missing values
+numeric_cols <- names(voice_data_model)[sapply(voice_data_model, is.numeric)]
+
+for (col in numeric_cols) {
+  voice_data_model[[col]][is.na(voice_data_model[[col]])] <- median(
+    voice_data_model[[col]],
+    na.rm = TRUE
+  )
+}
+
+# Check missing values after preprocessing
+missing_table <- data.frame(
+  Variable = names(voice_data_model),
+  Missing_Count = colSums(is.na(voice_data_model))
+)
+
+summary(voice_data_model$gender)
+```
+
+4. Exploratory Data Analysis
+4.1 Gender Distribution
+```{r}
+gender_count <- voice_data_model %>%
+  count(gender)
+
+ggplot(gender_count, aes(x = gender, y = n, fill = gender)) +
+  geom_col() +
+  labs(
+    title = "Gender Distribution of Voice Dataset",
+    x = "Gender",
+    y = "Number of Samples"
+  ) +
+  theme_minimal()
+```
+
+4.2 Distribution of Major Voice Features
+```{r}
+voice_data_model %>%
+  select(
+    gender,
+    PitchMean,
+    PitchStd,
+    SpectralCentroid,
+    SpectralSpread,
+    SpectralRolloffPoint
+  ) %>%
+  pivot_longer(
+    cols = -gender,
+    names_to = "Feature",
+    values_to = "Value"
+  ) %>%
+  ggplot(aes(x = gender, y = Value, fill = gender)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~ Feature, scales = "free_y") +
+  labs(
+    title = "Distribution of Spectral and Pitch Features by Gender",
+    x = "Gender",
+    y = "Feature Value"
+  ) +
+  theme_minimal()
+```
+4.3 MFCC Feature Comparison
+```{r}
+voice_data_model %>%
+  select(gender, MFCC0:MFCC12) %>%
+  pivot_longer(
+    cols = -gender,
+    names_to = "Feature",
+    values_to = "Value"
+  ) %>%
+  ggplot(aes(x = gender, y = Value, fill = gender)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~ Feature, scales = "free_y") +
+  labs(
+    title = "Distribution of MFCC Features by Gender",
+    x = "Gender",
+    y = "MFCC Value"
+  ) +
+  theme_minimal()
+```
+
+4.4 Correlation Heatmap
+```{r}
+x_data <- voice_data_model %>%
+  select(-gender)
+
+cor_matrix <- cor(x_data, use = "complete.obs")
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.65,
+  tl.col = "black",
+  title = "Correlation Heatmap of Extracted Voice Features",
+  mar = c(0, 0, 2, 0)
+)
+```
+
+5. Train-Test Split
+```{r}
+set.seed(123)
+
+train_index <- createDataPartition(
+  voice_data_model$gender,
+  p = 0.8,
+  list = FALSE
+)
+
+train_data <- voice_data_model[train_index, ]
+test_data <- voice_data_model[-train_index, ]
+
+x_train <- train_data %>%
+  select(-gender)
+
+y_train <- train_data$gender
+
+x_test <- test_data %>%
+  select(-gender)
+
+y_test <- test_data$gender
+
+preprocess_model <- preProcess(
+  x_train,
+  method = c("center", "scale")
+)
+
+x_train_scaled <- predict(preprocess_model, x_train)
+x_test_scaled <- predict(preprocess_model, x_test)
+
+train_scaled <- data.frame(
+  gender = y_train,
+  x_train_scaled
+)
+
+test_scaled <- data.frame(
+  gender = y_test,
+  x_test_scaled
+)
+
+dim(train_scaled)
+dim(test_scaled)
+```
+
+6. Logistic Regression without PCA
+```{r}
+model_raw <- glm(
+  gender ~ .,
+  data = train_scaled,
+  family = binomial
+)
+
+summary(model_raw)
+```
+6.1 VIF Check
+```{r}
+vif_table <- tryCatch({
+  
+  vif_values <- car::vif(model_raw)
+  
+  data.frame(
+    Feature = names(vif_values),
+    VIF = as.numeric(vif_values)
+  )
+  
+}, error = function(e) {
+  
+  data.frame(
+    Message = "VIF could not be computed due to perfect multicollinearity or model singularity."
+  )
+  
+})
+
+knitr::kable(
+  vif_table,
+  digits = 3,
+  caption = "VIF Check Result for Logistic Regression without PCA"
+)
+```
+
+7. PCA
+```{r}
+pca_model <- prcomp(
+  x_train_scaled,
+  center = FALSE,
+  scale. = FALSE
+)
+
+explained_variance <- pca_model$sdev^2 / sum(pca_model$sdev^2)
+
+pca_variance_df <- data.frame(
+  PC_Index = seq_along(explained_variance),
+  Variance = explained_variance,
+  CumulativeVariance = cumsum(explained_variance)
+)
+
+knitr::kable(
+  pca_variance_df,
+  digits = 3,
+  caption = "Explained Variance by Principal Components"
+)
+```
+
+7.1 Scree Plot
+```{r}
+ggplot(pca_variance_df, aes(x = PC_Index, y = CumulativeVariance)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0.90, linetype = "dashed") +
+  labs(
+    title = "Cumulative Explained Variance by Principal Components",
+    x = "Number of Principal Components",
+    y = "Cumulative Explained Variance"
+  ) +
+  theme_minimal()
+```
+
+7.2 Selection of Principal Components
+```{r}
+num_pcs <- which(cumsum(explained_variance) >= 0.90)[1]
+
+num_pcs
+
+train_pca_scores <- as.data.frame(
+  pca_model$x[, 1:num_pcs, drop = FALSE]
+)
+
+train_pca_scores$gender <- y_train
+
+test_pca_scores <- as.data.frame(
+  predict(pca_model, newdata = x_test_scaled)[, 1:num_pcs, drop = FALSE]
+)
+
+test_pca_scores$gender <- y_test
+```
+
+
+7.3 PCA Score Plot
+```{r}
+ggplot(train_pca_scores, aes(x = PC1, y = PC2, color = gender)) +
+  geom_point(alpha = 0.7) +
+  labs(
+    title = "PCA Score Plot: PC1 vs PC2",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal()
+```
+
+8.Logistic Regression with PCA
+```{r}
+model_pca <- glm(
+  gender ~ .,
+  data = train_pca_scores,
+  family = binomial
+)
+
+summary(model_pca)
+```
+
+9.Model Evaluation
+```{r}
+evaluate_model <- function(true_labels, predicted_prob, threshold = 0.5) {
+  
+  predicted_class <- ifelse(
+    predicted_prob >= threshold,
+    "male",
+    "female"
+  )
+  
+  predicted_class <- factor(
+    predicted_class,
+    levels = c("female", "male")
+  )
+  
+  cm <- confusionMatrix(
+    predicted_class,
+    true_labels,
+    positive = "male"
+  )
+  
+  roc_obj <- roc(
+    response = true_labels,
+    predictor = predicted_prob,
+    levels = c("female", "male"),
+    direction = "<",
+    quiet = TRUE
+  )
+  
+  result <- data.frame(
+    Accuracy = as.numeric(cm$overall["Accuracy"]),
+    BalancedAccuracy = as.numeric(cm$byClass["Balanced Accuracy"]),
+    Precision = as.numeric(cm$byClass["Precision"]),
+    Recall = as.numeric(cm$byClass["Recall"]),
+    F1 = as.numeric(cm$byClass["F1"]),
+    AUC = as.numeric(auc(roc_obj))
+  )
+  
+  return(result)
+}
+```
+
+
+9.1 Performance Comparison
+```{r}
+raw_prob <- predict(
+  model_raw,
+  newdata = test_scaled,
+  type = "response"
+)
+
+pca_prob <- predict(
+  model_pca,
+  newdata = test_pca_scores,
+  type = "response"
+)
+
+raw_eval <- evaluate_model(y_test, raw_prob)
+pca_eval <- evaluate_model(y_test, pca_prob)
+
+comparison_table <- bind_rows(
+  Raw_Logistic = raw_eval,
+  PCA_Logistic = pca_eval,
+  .id = "Model"
+)
+
+knitr::kable(
+  comparison_table,
+  digits = 3,
+  caption = "Performance Comparison between Raw Logistic Regression and PCA Logistic Regression"
+  )
+
+```
+
+9.2 Confusion Matrices
+```{r}
+raw_pred_class <- ifelse(raw_prob >= 0.5, "male", "female")
+raw_pred_class <- factor(raw_pred_class, levels = c("female", "male"))
+
+pca_pred_class <- ifelse(pca_prob >= 0.5, "male", "female")
+pca_pred_class <- factor(pca_pred_class, levels = c("female", "male"))
+
+confusionMatrix(raw_pred_class, y_test, positive = "male")
+confusionMatrix(pca_pred_class, y_test, positive = "male")
+```
+9.3 ROC Curve
+```{r}
+roc_raw <- roc(
+  y_test,
+  raw_prob,
+  levels = c("female", "male"),
+  direction = "<",
+  quiet = TRUE
+)
+
+roc_pca <- roc(
+  y_test,
+  pca_prob,
+  levels = c("female", "male"),
+  direction = "<",
+  quiet = TRUE
+)
+
+plot(
+  roc_raw,
+  col = "blue",
+  lwd = 2,
+  main = "ROC Curve Comparison"
+)
+
+plot(
+  roc_pca,
+  col = "red",
+  lwd = 2,
+  add = TRUE
+)
+
+legend(
+  "bottomright",
+  legend = c(
+    paste0("Raw Logistic AUC = ", round(auc(roc_raw), 3)),
+    paste0("PCA Logistic AUC = ", round(auc(roc_pca), 3))
+  ),
+  col = c("blue", "red"),
+  lwd = 2
+)
+```
+
+10. Robustness Test under Gender-Ratio Imbalance
+```{r}
+create_imbalanced_test <- function(data, male_ratio = 0.5, total_n = 100) {
+  
+  male_n <- round(total_n * male_ratio)
+  female_n <- total_n - male_n
+  
+  male_data <- data %>%
+    filter(gender == "male")
+  
+  female_data <- data %>%
+    filter(gender == "female")
+  
+  if (nrow(male_data) < male_n | nrow(female_data) < female_n) {
+    return(NULL)
+  }
+  
+  sampled_data <- bind_rows(
+    male_data %>% sample_n(male_n),
+    female_data %>% sample_n(female_n)
+  )
+  
+  return(sampled_data)
+}
+
+run_robustness_test <- function(
+    male_ratio,
+    n_repeat = 50,
+    total_n = 100
+) {
+  
+  result_list <- list()
+  
+  for (i in 1:n_repeat) {
+    
+    sampled_test <- create_imbalanced_test(
+      data = test_scaled,
+      male_ratio = male_ratio,
+      total_n = total_n
+    )
+    
+    if (is.null(sampled_test)) next
+    
+    sampled_y <- sampled_test$gender
+    sampled_x <- sampled_test %>%
+      select(-gender)
+    
+    sampled_raw_prob <- predict(
+      model_raw,
+      newdata = sampled_test,
+      type = "response"
+    )
+    
+    sampled_raw_eval <- evaluate_model(
+      sampled_y,
+      sampled_raw_prob
+    )
+    
+    sampled_pca_x <- as.data.frame(
+      predict(pca_model, newdata = sampled_x)[, 1:num_pcs, drop = FALSE]
+    )
+    
+    sampled_pca_prob <- predict(
+      model_pca,
+      newdata = sampled_pca_x,
+      type = "response"
+    )
+    
+    sampled_pca_eval <- evaluate_model(
+      sampled_y,
+      sampled_pca_prob
+    )
+    
+    temp_result <- bind_rows(
+      Raw_Logistic = sampled_raw_eval,
+      PCA_Logistic = sampled_pca_eval,
+      .id = "Model"
+    )
+    
+    temp_result$MaleRatio <- male_ratio
+    temp_result$Repeat <- i
+    
+    result_list[[i]] <- temp_result
+  }
+  
+  bind_rows(result_list)
+}
+```
+
+```{r}
+ratio_list <- c(0.5, 0.7, 0.8, 0.9)
+
+robustness_results <- map_dfr(
+  ratio_list,
+  ~ run_robustness_test(
+    male_ratio = .x,
+    n_repeat = 50,
+    total_n = 100
+  )
+)
+
+robustness_results$GenderRatio <- paste0(
+  round(robustness_results$MaleRatio * 10),
+  ":",
+  round((1 - robustness_results$MaleRatio) * 10)
+)
+
+head(robustness_results)
+```
+
+10.1 Robustness Summary
+```{r}
+robustness_summary <- robustness_results %>%
+  group_by(GenderRatio, Model) %>%
+  summarise(
+    Mean_Accuracy = mean(Accuracy, na.rm = TRUE),
+    SD_Accuracy = sd(Accuracy, na.rm = TRUE),
+    Mean_BalancedAccuracy = mean(BalancedAccuracy, na.rm = TRUE),
+    SD_BalancedAccuracy = sd(BalancedAccuracy, na.rm = TRUE),
+    Mean_F1 = mean(F1, na.rm = TRUE),
+    SD_F1 = sd(F1, na.rm = TRUE),
+    Mean_AUC = mean(AUC, na.rm = TRUE),
+    SD_AUC = sd(AUC, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  robustness_summary,
+  digits = 3,
+  caption = "Robustness Test Results under Gender-Ratio Imbalance"
+)
+```
+10.2 F1-score Robustness Plot
+```{r}
+ggplot(
+  robustness_results,
+  aes(x = GenderRatio, y = F1, color = Model, group = Model)
+) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1) +
+  stat_summary(fun = mean, geom = "point", size = 2) +
+  stat_summary(
+    fun.data = mean_sdl,
+    fun.args = list(mult = 1),
+    geom = "errorbar",
+    width = 0.1
+  ) +
+  labs(
+    title = "F1-score Stability under Gender-Ratio Imbalance",
+    x = "Male:Female Ratio in Test Data",
+    y = "F1-score"
+  ) +
+  theme_minimal()
+```
+10.3 AUC Robustness Plot
+```{r}
+ggplot(
+  robustness_results,
+  aes(x = GenderRatio, y = AUC, color = Model, group = Model)
+) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1) +
+  stat_summary(fun = mean, geom = "point", size = 2) +
+  stat_summary(
+    fun.data = mean_sdl,
+    fun.args = list(mult = 1),
+    geom = "errorbar",
+    width = 0.1
+  ) +
+  labs(
+    title = "AUC Stability under Gender-Ratio Imbalance",
+    x = "Male:Female Ratio in Test Data",
+    y = "AUC"
+  ) +
+  theme_minimal()
+```
+
+11. Statistical Tests
+```{r}
+test_results <- robustness_results %>%
+  select(Repeat, GenderRatio, Model, F1, AUC, BalancedAccuracy) %>%
+  pivot_wider(
+    names_from = Model,
+    values_from = c(F1, AUC, BalancedAccuracy)
+  )
+
+f1_test_results <- test_results %>%
+  group_by(GenderRatio) %>%
+  summarise(
+    Mean_Difference_F1 = mean(
+      F1_PCA_Logistic - F1_Raw_Logistic,
+      na.rm = TRUE
+    ),
+    P_Value_F1 = t.test(
+      F1_Raw_Logistic,
+      F1_PCA_Logistic,
+      paired = TRUE
+    )$p.value,
+    .groups = "drop"
+  )
+
+auc_test_results <- test_results %>%
+  group_by(GenderRatio) %>%
+  summarise(
+    Mean_Difference_AUC = mean(
+      AUC_PCA_Logistic - AUC_Raw_Logistic,
+      na.rm = TRUE
+    ),
+    P_Value_AUC = t.test(
+      AUC_Raw_Logistic,
+      AUC_PCA_Logistic,
+      paired = TRUE
+    )$p.value,
+    .groups = "drop"
+  )
+
+knitr::kable(
+  f1_test_results,
+  digits = 4,
+  caption = "Paired t-test Results for F1-score Difference"
+)
+
+knitr::kable(
+  auc_test_results,
+  digits = 4,
+  caption = "Paired t-test Results for AUC Difference"
+)
+```
+12. External Test Prediction
+```{r}
+test_file_names <- external_test$FileName
+
+external_test_model <- external_test %>%
+  select(-FileName)
+
+# Use only predictors used in training
+external_test_model <- external_test_model %>%
+  select(all_of(names(x_train)))
+
+# Median imputation based on training data
+for (col in names(external_test_model)) {
+  external_test_model[[col]][is.na(external_test_model[[col]])] <- median(
+    x_train[[col]],
+    na.rm = TRUE
+  )
+}
+
+external_test_scaled <- predict(
+  preprocess_model,
+  external_test_model
+)
+
+# Raw logistic prediction
+external_raw_prob <- predict(
+  model_raw,
+  newdata = external_test_scaled,
+  type = "response"
+)
+
+external_raw_pred <- ifelse(
+  external_raw_prob >= 0.5,
+  "male",
+  "female"
+)
+
+# PCA logistic prediction
+external_pca_scores <- as.data.frame(
+  predict(pca_model, newdata = external_test_scaled)[, 1:num_pcs, drop = FALSE]
+)
+
+external_pca_prob <- predict(
+  model_pca,
+  newdata = external_pca_scores,
+  type = "response"
+)
+
+external_pca_pred <- ifelse(
+  external_pca_prob >= 0.5,
+  "male",
+  "female"
+)
+
+test_prediction_result <- data.frame(
+  FileName = test_file_names,
+  Raw_Logistic_Prob_Male = external_raw_prob,
+  Raw_Logistic_Prediction = external_raw_pred,
+  PCA_Logistic_Prob_Male = external_pca_prob,
+  PCA_Logistic_Prediction = external_pca_pred
+)
+
+knitr::kable(
+  head(test_prediction_result, 20),
+  digits = 3,
+  caption = "Predicted Gender for External Test Audio Files"
+)
+
+write.csv(
+  test_prediction_result,
+  file.path(project_dir, "test_prediction_result.csv"),
+  row.names = FALSE
+)
+```
+
+13. Conclusions
+
+The objective of this project was to compare logistic regression models with and without PCA for voice-based gender classification.
+
+The original voice recordings were first trimmed to the middle two seconds to reduce the effect of silence and background noise at the beginning and ending parts of the recordings. Acoustic features were extracted using Python and then analyzed in R. The final feature set consisted of 13 MFCC features, three spectral features, and two pitch-related features.
+
+The non-PCA logistic regression model used the original extracted voice features, while the PCA-based logistic regression model used principal components that explained at least 90% of the variance in the feature space.
+
+The models were evaluated using Accuracy, Balanced Accuracy, Precision, Recall, F1-score, and AUC. In addition, robustness was examined under different gender-ratio conditions in the test data.
+
+If the PCA-based model shows similar or better performance with fewer predictors, PCA can be interpreted as useful for reducing dimensionality and improving model stability. If the PCA-based model shows smaller performance variation under imbalanced gender-ratio conditions, this supports the hypothesis that PCA improves robustness.
